@@ -1,0 +1,760 @@
+#!/usr/bin/php -q
+<?php
+/** 
+ * Author: Dan Shumaker
+ * Date: 3/6/2012
+ * 
+ * Import Family Support Network users into drupal.
+ * execute:
+ *  fsn_setup --all 
+ *
+ * options:
+ *  fsn_setup --help
+ *  
+ */
+
+require_once dirname(__FILE__) . '/dan_admin.php';
+
+function all() {
+  global $cli_args;
+
+  //for each step arg set cli_option to true;
+  foreach( $cli_args->functions as $index => $value ) {
+    $cli_args->functions[$index]['value'] = true;
+  }
+  $index = $cli_args->get_arg_index('filerestore');
+  $cli_args->functions[$index]['value'] = false;
+
+}
+function drop_old() {
+  $tables = array( 'content_type_parent', 'content_type_child', 'node_fsn_adult', 'node_fsn_child' );
+  foreach ($tables as $table) {
+    if (table_exists($table) ) {
+      myq('drop table ' . $table );
+    }
+  }
+}
+function clean_cck() {
+  boot_drupal();
+  require_once './includes/install.inc';
+  drupal_install_modules(array('fsn_types_feature'));
+  `drush dis fsn_types_feature -y`;
+  `drush en fsn_types_feature, fsn, cwd_fsn_search -y`;
+  `drush fr 'fsn_types_feature' -y`;
+  require_once 'sites/all/modules/contrib/cck/includes/content.crud.inc';
+  $fields = array('field_street_address1', 'field_street_address2', 'field_city', 'field_state', 'field_zip', 'field_country', 'field_location');
+  foreach($fields as $field) {
+    myp($field);
+    // This should have worked
+    //content_field_instance_delete($field, 'fsn_adult', FALSE);
+    myq("delete from content_node_field_instance where type_name='fsn_adult' and field_name='" . $field . "'");
+    myq("delete from content_node_field where field_name='" . $field . "'" );
+    drop_column('content_type_fsn_adult', $field . "_value");
+  }
+  // seeing if I can switch back to the drupal connection programatically via db_set_active('default');
+  //module_disable(array('drupalvb'));
+}
+function table_creation() {
+  global $cli_args;
+  $data_file = dirname(__FILE__) . '/data/create_fsn.sql'; 
+  $cmd = "mysql -u ".$cli_args->args['username'].' -p'.$cli_args->args['password'].' -h '.$cli_args->args['host'].' '. $cli_args->args['database'].'  <'. $data_file; 
+  $result = shell_exec($cmd);
+
+  if (!$result) {
+    print_r($result);
+  } else {
+    myp("ERROR: Table creation didn't work");
+    print_r($result);
+    exit();
+  }
+}
+function zipcodes() {
+  global $cli_args;
+  $data_file = dirname(__FILE__) . '/data/zipcodes.sql'; 
+  $cmd = "mysql -u ".$cli_args->args['username'].' -p'.$cli_args->args['password'].' -h '.$cli_args->args['host'].' '. $cli_args->args['database'].'  <'. $data_file; 
+  $result = shell_exec($cmd);
+
+  if (!$result) {
+    print_r($result);
+  } else {
+    myp("ERROR: Zipcode importing did NOT work");
+    print_r($result);
+    exit();
+  }
+}
+function import_excel_db($file) {
+  global $cli_args;
+  $cmd = "mysqlimport --verbose --host=" . $cli_args->args['host'] . " --user=".$cli_args->args['username'].' -p'.$cli_args->args['password']." --local --fields-terminated-by='\t' --lines-terminated-by='\n' --ignore-lines=1 ".$cli_args->args['database'].' '.$file;
+  myp($cmd);
+  $result = `$cmd`;
+  if (!$result) { die('Failed to import ' . $file ); }
+  /* creating tables to retain the unmodified originals */
+  $info = pathinfo($file);
+  $table_name = basename($file,'.'.$info['extension']);
+  myq('CREATE TABLE ' . $table_name . '_orig AS (SELECT * FROM ' . $table_name . ')' );
+}
+function data_import() {
+  global $cli_args;
+  $scriptdir = dirname(__FILE__);
+  if ($cli_args->args['testset']) {
+    import_excel_db( $scriptdir . '/data/fsn_adult.txt_test_set');
+    import_excel_db( $scriptdir . '/data/fsn_child.txt_test_set');
+  } else {
+    import_excel_db( $scriptdir . '/data/fsn_adult.txt');
+    import_excel_db( $scriptdir . '/data/fsn_child.txt');
+  }
+  import_excel_db( $scriptdir . '/data/fsn_vb_account_emails.txt');
+  import_excel_db( $scriptdir . '/data/fsn_vb_collisions.txt');
+}
+
+function jeff_fix() {
+  // This makes it so that Jeff's FSN account gets matched up to his vb account.
+  myq('update fsn_adult set dname="Jeff",email_address="jeffh@XXX.com" where user_id=1');
+}
+
+function remove_duplicates() {
+    // Ignore Unique key eliminates duplicates
+    myq('ALTER IGNORE TABLE fsn_adult ADD UNIQUE KEY(email_address)') ;
+    myq('ALTER IGNORE TABLE fsn_vb_collisions ADD UNIQUE KEY(vbemail)') ;
+
+    // These next four are so I can update the emails after validating them if possible
+    // Adding column so that we can change emails (unique keys can't be changed)
+    myq("ALTER IGNORE TABLE fsn_adult ADD COLUMN email VARCHAR(64) NOT NULL DEFAULT ''") ;
+    myq('UPDATE fsn_adult set email=email_address');
+    myq('ALTER TABLE fsn_adult DROP COLUMN email_address');
+    myq("ALTER TABLE fsn_adult CHANGE email email_address varchar(64) NOT NULL DEFAULT ''");
+}
+function remove_vb_users() {
+    myq('CREATE TABLE withoutvb AS (SELECT * FROM fsn_adult WHERE email_address NOT IN (SELECT email FROM fsn_vb_account_emails))');
+    myq('DROP table fsn_adult');
+    myq('RENAME TABLE withoutvb TO fsn_adult');
+}
+function delete_vb_passwords() {
+    myq('UPDATE fsn_adult as fa INNER JOIN fsn_vb_collisions as fvb on (fa.user_id=fvb.xluid and fvb.pwd_match="no") set fa.password=""'); 
+}
+function sanitize_emails() {
+    myq("alter table fsn_adult add valid_email bool NOT NULL DEFAULT '0' ");
+    $result = myq('select user_id, email_address from fsn_adult');
+    while ( $row = mysql_fetch_assoc( $result )) {
+        //myp("checking " . $row['user_id'] . " " . $row['email_address']);
+        $newmail = email_check($row['email_address']);
+        myq('update fsn_adult set email_address="' . $newmail[0] . '", valid_email=' . $newmail[1] . ' where user_id=' . $row['user_id']   );
+    }
+}
+function delete_drupal_users() {
+    myq('delete from users where uid>5');
+}
+function sanitize_names() {
+    $result = myq('select user_id, first_name, last_name from fsn_adult');
+    while ($row = mysql_fetch_assoc($result)) {
+        $first = sanitize($row['first_name']);
+        $last = sanitize($row['last_name']);
+        myq('update fsn_adult set first_name="' . $first . '", last_name="' . $last . '" where user_id=' . $row['user_id']); 
+    }
+}
+function create_unique_drupal_user_names() {
+    $add_numbers_to_collisions = 'INSERT INTO fsn_adult_dnames (user_id,drupal_name,first_name,last_name) (SELECT f.user_id,CONCAT(SUBSTRING(f.first_name,1,1),f.last_name, (SELECT COUNT(*) FROM fsn_adult f2 WHERE SUBSTRING(f2.first_name,1,1) = SUBSTRING(f.first_name,1,1) AND f2.last_name = f.last_name AND f2.user_id <= f.user_id)),f.first_name,f.last_name from fsn_adult f)'; 
+    myq($add_numbers_to_collisions);
+    myq("ALTER table fsn_adult add dname varchar(32) NOT NULL DEFAULT ''");
+    myq("ALTER table fsn_adult add duid int(11) NOT NULL DEFAULT '0'");
+    myq("ALTER table fsn_adult add dnid int(11) NOT NULL DEFAULT '0'");
+    myq("ALTER table fsn_adult add dvid int(11) NOT NULL DEFAULT '0'");
+    myq('UPDATE fsn_adult INNER JOIN fsn_adult_dnames on (fsn_adult.user_id = fsn_adult_dnames.user_id) set fsn_adult.dname = fsn_adult_dnames.drupal_name');
+    $result = myq('select user_id, dname from fsn_adult');
+    while ( $row = mysql_fetch_assoc($result)) {
+      myq('update fsn_adult set dname="' . one_strip( $row['dname']) . '" where user_id='. $row['user_id']);
+    }
+}
+
+function set_dnames_from_vb() {
+  myq('UPDATE fsn_adult INNER JOIN fsn_vb_collisions on (fsn_adult.user_id=fsn_vb_collisions.xluid) set dname=fsn_vb_collisions.vbname');
+}
+
+/** Strip off 1 if it's not after any other number (this is to prevent jb11 turning into jb which already exists), otherwise we could just rtrim($dname, '1');
+ * ie, strip off the 1 from users because it's implied (jb2 means there is a jb already, and only need a 1 if there is a 2 but the sql put
+ * a 1 after all names even if they didn't have a 2).
+ */
+function one_strip($name) {
+  $second = ord($name[strlen($name)-2]);
+  if ((strpos($name, '1') == strlen($name)-1 ) && ( $second < 48 || $second > 57 )) {
+    $newname = rtrim($name, '1');
+  } else {
+    $newname = $name;
+  }
+  return $newname;
+}
+
+/** Use this if you want to make the email what it should be
+ *
+ */
+function fake_to_real_email($fake) {
+  $a = sscanf($fake, 'danpshumaker+%s');
+  $b = strstr($a[0], '@', true);
+  $c = str_replace("X.X", "@", $b);
+  return $c;
+}
+
+function create_drupal_users() {
+    $fsn_source_users = 'SELECT * FROM fsn_adult';
+    $result = myq($fsn_source_users);
+    print("\nCreating Adults:\n ");
+    $i = 0;
+    while ($row = mysql_fetch_assoc($result)) {
+        $i++;
+        // Using fake email to make sure that any drupal emails go to fake email first
+        //$email = 'danpshumaker+' . str_replace("@", "X.X", $row['email_address']) . '@gmail.com';
+        $email = $row['email_address'];
+        $name = $row['dname'];
+
+        // use this one when going live
+        $fields = array( 'name' => $name, 'mail' => $email, 'pass' => $row['password'], 'status' => 1,);
+        $account = user_save('', $fields);
+        // Do this if want to send them an email.
+        //_user_mail_notify('status_activated', $account);
+        if ($account) {
+            for($x=0; $x<strlen($i); $x++){ echo chr(8);}
+            print $i;
+        } else {
+            myp("User creation failed");
+            myp($fields);
+            exit();
+        }
+        create_adult_node($row, $account);
+    }
+    print "\n";
+}
+function create_adult_node($row, $account) {
+  global $cli_args;
+
+	$node = new stdClass();
+	//print_r($node);
+	
+	//Set up default values, if required.
+	node_object_prepare($node);
+
+	//Specify the content type
+	$node->type = 'fsn_adult';
+
+	//Specify the title
+	$node->title = sanitize($row['first_name']) . " " . sanitize($row['last_name']);
+	
+	//Specify an author for the node
+	$node->uid = $account->uid;
+
+	//Add the CCK fields data
+	$node->field_baby_sit[0]['value'] = strtoupper($row['baby_sit']);
+	$node->field_category[0]['value'] = $row['category_id'];
+	$node->field_college_parent[0]['value'] = strtoupper($row['college_parent']);
+	$node->field_hide_address[0]['value'] = strtoupper($row['hide_address_information']);
+	$node->field_meet_or_chat[0]['value'] = strtoupper($row['meet_or_chat']);
+	$node->field_show_first_letter[0]['value'] = strtoupper($row['show_only_first_letter']);
+  $location = array(
+    'lid' => NULL,
+    'street' => check_plain($row['address_line1']),
+    'additional' => check_plain($row['address_line2']),
+    'city' => check_plain($row['city']),
+    'province' => $row['state_province'],
+    'postal_code' => check_plain($row['zip5']),
+    'country' => strtolower($row['country']),
+    'source' => 4,
+    'inhibit_geocode' => FALSE,
+  );
+  $settings = variable_get('location_settings_node_fsn_adult', array());
+  $location['location_settings'] = $settings;
+  $node->locations[] = $location;
+	$node->field_first_name[0]['value'] = check_plain($row['first_name']);
+	$node->field_last_name[0]['value'] = check_plain($row['last_name']);
+	$node->field_birthdate[0]['value'] = check_adult_date($row['birthdate']);
+	$node->field_gender[0]['value'] = strtoupper($row['gender']);
+  if ($row['photo_url'] !== '') {
+    //$legacypath = $_SERVER['DOCUMENT_ROOT'] . base_path() . file_directory_path() . '/legacy' . $row['photo_url'];
+    // Because _SERVER doesn't exist in batch and the filesys path is not in ENV's or defined_constants then hardcode to getcwd
+    $abs_base_path = getcwd() . '/' . file_directory_path();
+    $legacyfile = $abs_base_path . '/legacy/' . $row['photo_url'];
+    $new_drupal_imported_file = file_directory_path() . '/fsn/' . basename($row['photo_url']);
+    if (is_file($legacyfile) ) {
+      $results = field_file_save_file($legacyfile, array(), $new_drupal_imported_file, $account);
+      if ($results) {
+        $node->field_person_photo[0] = $results;
+      } else {
+        myp('Problem with this file ' .  $legacyfile, FALSE, TRUE);
+      }
+    } else {
+      myp("This file doesn't exist " . $legacyfile);
+    }
+  }
+
+	$node->field_celiac[0]['value'] = strtoupper($row['celiac']);
+	$node->field_on_pump[0]['value'] = strtoupper($row['on_pump']);
+	$node->field_diabetes_type[0]['value'] = $row['diabetes_type'];
+	$node->field_diagnosis_date[0]['value'] = check_adult_date($row['diagnosed_date']);
+	$node->field_about[0]['value'] = str_replace('"', '',$row['about']);
+	$node->created = $row['date_added'];
+	$node->changed = $row['date_updated'];
+	
+	//taxonomy. The vocabulary ID (vid) is 7
+	//$node->taxonomy['tags'][7] = $row['tm_topic'];
+
+  $node->validated = TRUE;
+	$node->status = 1;
+  $node->promote = 0;
+  $node->sticky = 0;
+  $node->teaser = '';
+  $node->body = '';
+  $node->name = $account->name;
+  $node->format = 1;
+  $node->comment = 0;
+ 	
+	//Save the node object into the database.
+  // Don't need node_submit because I'm already filling the
+  // created, user, body, teaser, title fields
+  //print_r($node);
+	$node->date = $row['date_added'];
+  node_submit($node);
+  //print_r($node);
+	node_save($node);
+  //print_r($node);
+  //
+  if ($row['photo_url'] !== '') {
+    myp($row['photo_url']);
+    myp($node->field_person_photo);
+  }
+
+  if ($node->nid) {
+    //myp("Created fsn_adult node: " . $node->nid, FALSE, TRUE);
+  } else {
+    myp("Failed node creation", FALSE, TRUE );
+    myp($node);
+    exit();
+  }
+  // This function doesn't work as documented
+  //$return = db_set_active('default');
+  // drupalvb switches the database connnection so have to switch back.
+  mysql_connect($cli_args->args['host'],$cli_args->args['username'],$cli_args->args['password']);
+  mysql_select_db($cli_args->args['database'] ) or die( "Unable to select database");
+  myq('update fsn_adult set duid=' . $account->uid . ', dnid=' . $node->nid . ', dvid=' . $node->vid . ' where user_id=' . $row['user_id']  );
+}
+function delete_adults() {
+	$tables = array('content_field_childref','content_field_about', 'content_field_celiac', 'content_field_diabetes_type', 'content_field_diagnosis_date', 
+		'content_field_first_name', 'content_field_last_name', 'content_field_gender', 'content_field_on_pump',
+		'content_field_on_pump', 'content_field_person_photo', 'content_field_birthdate' );
+	foreach ($tables as $table) {
+    if ( table_exists($table) ) {
+      myq('DELETE ' . $table . ' FROM ' . $table . ' JOIN node ON node.nid = ' . $table . ".nid WHERE node.type='fsn_adult'");
+      myq('DELETE ' . $table . ' FROM '. $table . ' LEFT JOIN node on '. $table . '.nid=node.nid where node.nid is NULL');
+    }
+	}
+  myq("truncate content_type_fsn_adult");
+  myq("truncate drupalvb_users");
+  myq("truncate location");
+  myq("truncate location_instance");
+  myq("delete from node where type='fsn_adult'");
+  myq("delete from url_alias where dst like 'resources/fsn/%'");
+  myq("delete url_alias from url_alias left join users on users.uid=CONVERT(SUBSTR(url_alias.src, 6),SIGNED) where src like 'user/%' and uid is NULL");
+}
+
+function check_adult_date($date) {
+  
+  $nd = explode("/", $date);
+  if ($nd[2] > 12) {
+    $nd[2] = $nd[2] + 1900;
+  } else {
+    $nd[2] = $nd[2] + 2000;
+  }
+  $day = $nd[1];
+  $nd[1] = $nd[0];
+  $nd[0] = $nd[2];
+  $nd[2] = $day;
+
+  $nds = implode('-', $nd);
+  $baddate= strtotime($nds);
+  if (!$baddate) {
+    $baddate = strtotime('now');
+	} 
+  $newdate = date_make_date($baddate, NULL, DATE_UNIX);
+ /* $year = intval($newdate->format('Y'));
+  // Assuming all adults who sign up are less than 100 years old
+
+  if ( $year > 2012 ) {
+    $newdate->sub(new DateInterval('P100Y'));
+  }
+  */
+  return $newdate->format(DATE_FORMAT_ISO);
+}
+
+function create_children() {
+  boot_drupal();
+  myq("ALTER TABLE fsn_child add duid int(11) NOT NULL DEFAULT '0'");
+  myq("ALTER TABLE fsn_child add dnid int(11) NOT NULL DEFAULT '0'");
+  myq("ALTER TABLE fsn_child ADD dvid int(11) NOT NULL DEFAULT '0'");
+  myq("ALTER TABLE fsn_child ADD parent_nid int(11) NOT NULL DEFAULT '0'");
+  myq("ALTER TABLE fsn_child ADD parent_vid int(11) NOT NULL DEFAULT '0'");
+  $result = myq("select * from fsn_child");
+
+  print("\nCreating Children:\n ");
+  $i = 0;
+  while ($row = mysql_fetch_assoc($result)) {
+    $i++;
+    $node = new stdClass();
+
+    //Set up default values, if required.
+    node_object_prepare($node);
+
+    //Specify the content type
+    $node->type = 'fsn_child';
+
+    //Specify the title
+    $node->title = sanitize($row['c_first_name']) . " " . sanitize($row['c_last_name']);
+
+    //Add the CCK fields data
+    $node->field_last_name[0]['value'] = check_plain($row['c_last_name']);
+    $node->field_first_name[0]['value'] = check_plain($row['c_first_name']);
+    $node->field_birthdate[0]['value'] = check_adult_date($row['c_birthdate']);
+    $node->field_gender[0]['value'] = strtoupper($row['c_gender']);
+    if ($row['c_photo_url'] !== '') {
+      //$legacypath = $_SERVER['DOCUMENT_ROOT'] . base_path() . file_directory_path() . '/legacy' . $row['photo_url'];
+      // Because _SERVER doesn't exist in batch and the filesys path is not in ENV's or defined_constants then hardcode to getcwd
+      $abs_base_path = getcwd() . '/' . file_directory_path();
+      $legacyfile = $abs_base_path . '/legacy/' . $row['c_photo_url'];
+      $new_drupal_imported_file = file_directory_path() . '/fsn/' . basename($row['c_photo_url']);
+      if (is_file($legacyfile) ) {
+        $results = field_file_save_file($legacyfile, array(), $new_drupal_imported_file, $account);
+        if ($results) {
+          $node->field_child_photo[0] = $results;
+        } else {
+          myp('Problem with this file ' .  $legacyfile, FALSE, TRUE);
+        }
+      } else {
+        myp("This file doesn't exist " . $legacyfile);
+      }
+    }
+
+    $node->field_celiac[0]['value'] = strtoupper($row['c_celiac']);
+    $node->field_on_pump[0]['value'] = strtoupper($row['c_on_pump']);
+    $node->field_diabetes_type[0]['value'] = $row['c_diabetes_type'];
+    $node->field_diagnosis_date[0]['value'] = check_adult_date($row['c_diagnosed_date']);
+    $node->field_about[0]['value'] = str_replace('"','', $row['c_about']);
+    //$newmail = email_check($row['c_email_address']);
+    //$node->field_email[0]['value'] = $newemail[0];
+    $node->field_email[0]['value'] = $row['c_email_address'];
+    $node->created = $row['c_date_created'];
+    $node->changed = $row['c_date_updated'];
+    
+    //taxonomy. The vocabulary ID (vid) is 7
+    //$node->taxonomy['tags'][7] = $row['tm_topic'];
+
+    $node->validated = TRUE;
+    $node->status = 1;
+    $node->promote = 0;
+    $node->sticky = 0;
+    $node->teaser = '';
+    $node->body = '';
+    $node->name = $account->name;
+    $node->format = 1;
+    $node->comment = 0;
+    
+    //Save the node object into the database.
+    // Don't need node_submit because I'm already filling the
+    // created, user, body, teaser, title fields
+    //print_r($node);
+    $node->date = $row['c_date_created'];
+    node_submit($node);
+    //print_r($node);
+    node_save($node);
+    //print_r($node);
+    //
+    if ($row['c_photo_url'] !== '') {
+      myp($row['c_photo_url']);
+      myp($node->field_child_photo);
+    }
+
+    if ($node->nid) {
+      //myp("\nCreated fsn_child node: " . $node->nid, FALSE, TRUE);
+      for($x=0; $x<strlen($i); $x++){ echo chr(8);}
+      print $i;
+    } else {
+      myp("Failed node creation", FALSE, TRUE );
+      myp($node);
+      exit();
+    }
+    myq('update fsn_child set fsn_child.dnid ='. $node->nid . ', fsn_child.dvid=' . $node->vid . ' where fsn_child.child_id=' . $row['child_id'] );
+  }
+  print "\n";
+}
+
+/** Could use if (filter_var($email_a, FILTER_VALIDATE_EMAIL)) {
+ * but this is more to open standards.
+ */
+function email_check($email) {
+    $valid = 1;
+    if (strlen($email) < 3) {
+       myp("Empty Email address");
+       return array($email, 0);
+    }
+    // If it's not valid then try to fix it.
+    if (!validEmail($email)) {
+      $newstr = str_replace(' ','',$email);    // Strip off multiple spaces 
+      $newstr = str_replace('\'', '', $newstr);    // Strip off spaces and non-alpha-numeric 
+      $newstr = str_replace('"', '', $newstr);    // Strip off spaces and non-alpha-numeric 
+      $newstr2 = str_replace(',','',$newstr);    // Strip off spaces and non-alpha-numeric 
+      if (!validEmail($newstr2)) {
+          $newstr = str_replace(',','.', $newstr);
+      } else {  $newstr = $newstr2; } 
+        if (!validEmail($newstr)) {
+            myp("Can't fix this email " . $email, FALSE, TRUE);
+            $valid = 0;
+      } 
+      $email = $newstr;
+    }
+	return array($email, $valid);
+}
+function sanitize($str) {
+    $newstr = preg_replace('/\s[\s]+/','_',$str);    // Strip off multiple spaces 
+    $newstr = preg_replace('/[\s\W]+/','',$newstr);    // Strip off spaces and non-alpha-numeric 
+    //$newstr = strtolower($newstr); 
+	return $newstr;
+}
+
+/**
+ * taken from
+ * http://www.linuxjournal.com/article/9585?page=0,3
+Validate an email address.
+Provide email address (raw input)
+Returns true if the email address has the email 
+address format and the domain exists.
+*/
+function validEmail($email) {
+   $isValid = true;
+   $atIndex = strrpos($email, "@");
+   if (is_bool($atIndex) && !$atIndex) {
+      $isValid = false;
+   }
+   else {
+      $domain = substr($email, $atIndex+1);
+      $local = substr($email, 0, $atIndex);
+      $localLen = strlen($local);
+      $domainLen = strlen($domain);
+      if ($localLen < 1 || $localLen > 64) {
+         // local part length exceeded
+         $isValid = false;
+      }
+      else if ($domainLen < 1 || $domainLen > 255) {
+         // domain part length exceeded
+         $isValid = false;
+      }
+      else if ($local[0] == '.' || $local[$localLen-1] == '.') {
+         // local part starts or ends with '.'
+         $isValid = false;
+      } else if (preg_match('/\\.\\./', $local)) {
+         // local part has two consecutive dots
+         $isValid = false;
+      } else if (!preg_match('/^[A-Za-z0-9\\-\\.]+$/', $domain)) {
+         // character not valid in domain part
+         $isValid = false;
+      } else if (preg_match('/\\.\\./', $domain)) {
+         // domain part has two consecutive dots
+         $isValid = false;
+      } else if (!preg_match('/^(\\\\.|[A-Za-z0-9!#%&`_=\\/$\'*+?^{}|~.-])+$/', str_replace("\\\\","",$local))) {
+         // character not valid in local part unless 
+         // local part is quoted
+         if (!preg_match('/^"(\\\\"|[^"])+"$/', str_replace("\\\\","",$local))) {
+            $isValid = false;
+         }
+      }
+      /*if ($isValid && !(checkdnsrr($domain,"MX") || checkdnsrr($domain,"A"))) {
+         // domain not found in DNS
+         $isValid = false;
+      }*/
+   }
+   return $isValid;
+}
+
+function create_drupal_users_step() {
+  boot_drupal();
+  create_drupal_users();
+}
+
+function boot_drupal() {
+  if (!defined('DRUPAL_BOOTSTRAP_FULL')) {
+    // Assuming this script is in the ./scripts subdir
+    chdir(dirname(__FILE__)); 
+    chdir('..');
+    require_once './includes/bootstrap.inc';
+    error_reporting(E_ERROR & ~E_NOTICE);
+    if (!defined('DRUPAL_BOOTSTRAP_FULL')) {
+      print "drupal boostrap did NOT work: aborting";
+      exit();
+    }
+    drupal_bootstrap(DRUPAL_BOOTSTRAP_FULL);
+    module_load_include('inc', 'node', 'node.pages');
+  }
+}
+
+function files_backup() {
+  global $cli_args;
+  $files_table_file = dirname(__FILE__) . '/data/files_table_backup.sql';
+  $cmd= "mysqldump --user=".$cli_args->args['username'].' --password='.$cli_args->args['password'].' --host='.$cli_args->args['host'].' --quote-names --opt '.$cli_args->args['database'].' files  > '.$files_table_file; 
+  $result = `$cmd`;
+  if (!$result) {
+    print_r($result);
+  } else {
+    myp("ERROR: Files table backup did NOT work");
+    print_r($result);
+    exit();
+  }
+}
+
+function files_restore() {
+  global $cli_args;
+  $files_table_backup = dirname(__FILE__) . '/data/files_table_backup.sql';
+  $cmd= 'mysql -u '.$cli_args->args['username'].' -p'.$cli_args->args['password'].' -h '.$cli_args->args['host'].' '.$cli_args->args['database'].' < '.$files_table_backup;
+  $result = `$cmd`;
+  if (!$result) {
+    print_r($result);
+  } else {
+    myp("ERROR: Files table restore did NOT work");
+    print_r($result);
+    exit();
+  }
+}
+
+function delete_children() {
+  drop_column('fsn_child', 'dnid');
+  drop_column('fsn_child','duid');
+  drop_column('fsn_child', 'parent_nid');
+	$tables = array('content_field_about', 'content_field_celiac', 'content_field_diabetes_type', 'content_field_diagnosis_date', 
+		'content_field_first_name', 'content_field_last_name', 'content_field_gender', 'content_field_on_pump',
+		'content_field_on_pump', 'content_field_child_photo', 'content_field_birthdate' , 'content_field_parent');
+	foreach ($tables as $table) {
+		myq('DELETE ' . $table . ' FROM ' . $table . ' JOIN node ON node.nid = ' . $table . ".nid WHERE node.type='fsn_child'");
+		myq('DELETE ' . $table . ' FROM '. $table . ' left join node on '. $table . '.nid=node.nid where node.nid is NULL');
+	}
+  myq("truncate content_type_fsn_child");
+  myq("delete from node where type='fsn_child'");
+}
+function connect_children() {
+  myq('UPDATE fsn_child INNER JOIN fsn_adult ON (fsn_child.user_id = fsn_adult.user_id) set fsn_child.duid = fsn_adult.duid');
+  myq('UPDATE node INNER JOIN fsn_child ON (fsn_child.dnid = node.nid) set node.uid=fsn_child.duid');
+  myq('UPDATE fsn_child INNER JOIN fsn_adult ON (fsn_child.user_id = fsn_adult.user_id) set fsn_child.parent_nid=fsn_adult.dnid, fsn_child.parent_vid=fsn_adult.dvid');
+
+  // Setup the node references from Parents to Children
+  myq('truncate content_field_childref');
+  myq('INSERT INTO content_field_childref (vid, nid, delta, field_childref_nid) (SELECT fc.parent_vid, fc.parent_nid, (select count(*)-1 from fsn_child fc2 WHERE fc2.parent_nid=fc.parent_nid AND fc2.child_id <= fc.child_id), fc.dnid from fsn_child as fc )');
+    
+  // Setup the node references from Children to Parents
+  myq('truncate content_field_parent');
+  myq('INSERT INTO content_field_parent (vid, nid, delta, field_parent_nid) (SELECT fc.dvid, fc.dnid, (select count(*)-1 from fsn_child fc2 WHERE fc2.dnid=fc.dnid AND fc2.child_id <= fc.child_id), fc.parent_nid from fsn_child as fc )');
+}
+
+function rm_orphans() {
+
+  // We remove orphans because their parents have already been deleted in the master database for some reason and their kids were left behind.
+  // Delete them from the node table and then all the left joins work as they should
+  myq("DELETE from node where type='fsn_child' and uid=0");
+
+	$tables = array('content_type_fsn_child', 'content_field_childref','content_field_about', 'content_field_celiac', 'content_field_diabetes_type', 'content_field_diagnosis_date', 
+		'content_field_first_name', 'content_field_last_name', 'content_field_gender', 'content_field_on_pump',
+    'content_field_on_pump', 'content_field_person_photo', 'content_field_birthdate' , 'content_field_child_photo',  'content_field_parent' );
+	foreach ($tables as $table) {
+    if ( table_exists($table) ) {
+      myq('DELETE ' . $table . ' FROM '. $table . ' LEFT JOIN node on '. $table . '.nid=node.nid where node.nid is NULL');
+    }
+	}
+}
+
+function initialize_drupalvb_users() {
+  boot_drupal();
+  module_load_include('inc', 'drupalvb');
+  _drupalvb_init_user_map();
+}
+
+function timecheck() {
+  global $cli_args;
+
+	boot_drupal();
+	$result = myq('select birthdate, dname from fsn_adult');
+	while($row = mysql_fetch_assoc($result)) {
+			print "Date: " . $row['birthdate'] . " user: " . $row['dname'] ;
+		  $check = check_adult_date($row['birthdate']);
+			print " " . $check . "\n";
+	}
+}
+
+function reparent_fsn_menu() {
+
+  global $cli_args;
+
+  $result = myq('select mlid from menu_links where link_title="Resources"');
+  $mlid = mysql_fetch_assoc($result);
+  $fsnr = myq('select * from menu_links where link_title="Family Support Network" and menu_name="primary-links"');
+  $fsn = mysql_fetch_assoc($fsnr);
+  $result = myq('update menu_links set plid=' . $mlid['mlid'] . ' where mlid=' . $fsn['mlid'] );
+  $p1 = myq('update menu_links set p1=' . $mlid['mlid'] . ' where link_path like "resources/fsn%" and menu_name="primary-links"');
+  $p1 = myq('update menu_links set p1=' . $mlid['mlid'] . ' where link_path="node/add/fsn-adult" and menu_name="primary-links"');
+}
+
+
+/**
+ * Main
+ */
+
+ob_implicit_flush(TRUE);
+
+global $cli_args;
+$cli_args = new CommandLine();
+$cli_args->add_option( 'verbose' );
+$cli_args->add_option( 'timing' );
+$cli_args->add_option( 'prompts');
+$cli_args->add_option( 'host', 'localhost' );
+$cli_args->add_option( 'username', 'root' );
+$cli_args->add_option( 'password', 'XXXXX' );
+$cli_args->add_option( 'database', 'jnj_cwd_dev');
+$cli_args->add_option( 'testset' );
+$cli_args->add_function_option('tc', false, "Timecheck", "Timecheck?", 'timecheck');
+$cli_args->add_function_option( 'all', false, 'Executing all options', "3 2 1 ignition?", 'all');
+$cli_args->add_function_option( 'dropold', false, 'Dropping old tables', "Have the old tables been dropped?", 'drop_old');
+$cli_args->add_function_option( 'cleancck', false, 'Cleaning cck tables', "check content_type_fsn_adult and child?", 'clean_cck');
+$cli_args->add_function_option( 'createtables', false, 'Creating tables', "Is everything ok after table creation?", 'table_creation');
+$cli_args->add_function_option( 'zipcodes', false, 'Importing Zipcodes', "Did the zipcodes get imported in to zipcodes table?", 'zipcodes');
+$cli_args->add_function_option( 'importdata', false, 'Importing data', "Was the data imported?", 'data_import');
+$cli_args->add_function_option( 'unifyusernames', false, 'Unifying users who have multiple accounts', "Is everything ok after removing duplicates?", 'remove_duplicates');
+//$cli_args->add_function_option( 'removevbusers', false, 'Removing vb users from fsn user list', "Are the vb users removed?", 'remove_vb_users');
+$cli_args->add_function_option( 'deletevbpasswords', false, 'Empty passwords for vb colliding users', "The passwords empty for those users?", 'delete_vb_passwords');
+$cli_args->add_function_option( 'sanitizeemails', false, 'Sanitizing Emails', "Are the emails sanitized?", 'sanitize_emails');
+$cli_args->add_function_option( 'deletedrupalusers', false, 'Deleting drupal users', "Is the user table have 5 users in it?", 'delete_drupal_users');
+$cli_args->add_function_option( 'sanitizenames', false, 'Sanitizing user names for drupal', "Does fsn_adult have good first and last names?", 'sanitize_names');
+$cli_args->add_function_option( 'createusernames', false, 'Creating unique drupal user names', "Does fsn_adult have unque dnames?", 'create_unique_drupal_user_names');
+$cli_args->add_function_option( 'assignvbnames', false, "Use old vb usernames for drupal user names", "Are the old vb names in place?", 'set_dnames_from_vb');
+$cli_args->add_function_option( 'deleteadults', false, 'Deleting nodes of type fsn_adult', "Is the node table void of fsn_adult nodes?", 'delete_adults');
+$cli_args->add_function_option( 'fixjeff', false, "fixing Jeff's email", "Is Jeff's email set correctly?", 'jeff_fix');
+$cli_args->add_function_option( 'filesbackup', false, 'Backing up the files table',  "Does the data/files_table_backup.sql look good?", 'files_backup');
+$cli_args->add_function_option( 'filesrestore', false, 'Restoring the files table', 'Does the files db table not have fsn images in it?', 'files_restore');
+$cli_args->add_function_option( 'createdrupalusers', false, 'Creating drupal users',  "The users table should have fsn users in it now?", 'create_drupal_users_step');
+$cli_args->add_function_option( 'deletechildren', false, 'Deleting fsn_child nodes', "Is the node table void of fsn_child nodes ?", 'delete_children');
+$cli_args->add_function_option( 'createchildren', false, 'Creating Children', "Are there fsn_child nodes?", 'create_children');
+$cli_args->add_function_option( 'connect', false, 'Connect Children to parents', "Are there node->noderefs for fsn_child set?", 'connect_children');
+$cli_args->add_function_option( 'rm_orphans', false, "Remove kids that don't have parents", "Every Kid should have a parent?", 'rm_orphans');
+$cli_args->add_function_option( 'vbiu', false, "Initialize vb users", "check the drupalvb_users table?", 'initialize_drupalvb_users');
+$cli_args->add_function_option( 'movemenu', false, "Move fsn menus to correct spot", "Clear cache and check the menus?", 'reparent_fsn_menu');
+$cli_args->parseArgs($argv);
+
+mysql_connect($cli_args->args['host'],$cli_args->args['username'],$cli_args->args['password']);
+mysql_select_db($cli_args->args['database'] ) or die( "Unable to select database");
+
+$alltime = new StopWatch();
+while ($cli_args->processing) {
+  if ($cli_args->functions[$cli_args->current_step]['value']) {
+    myp($cli_args->functions[$cli_args->current_step]['title'], FALSE, TRUE);
+    pt(1);
+    $cli_args->functions[$cli_args->current_step]['function']();
+    pt();
+    myp($cli_args->functions[$cli_args->current_step]['prompt'], TRUE);
+  }
+  $cli_args->current_step++;
+  if ($cli_args->current_step >= count($cli_args->functions)) {
+    $cli_args->processing = false;
+  }
+}
+print date("g:i:s A D, F jS Y",time()) . " Elapsed: " . round($alltime->elapsed(),2)/60 . " Minutes \n";
+
+?>
